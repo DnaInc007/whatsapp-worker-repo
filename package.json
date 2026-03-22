@@ -1,0 +1,20 @@
+{
+  "name": "fdispatch-whatsapp-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "whatsapp:worker": "tsx workers/whatsapp-worker.ts"
+  },
+  "dependencies": {
+    "@next/env": "^15.5.9",
+    "@supabase/supabase-js": "^2.95.3",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "pino": "^9.9.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.5.7",
+    "tsx": "^4.20.5",
+    "typescript": "^5.6.3"
+  }
+}
