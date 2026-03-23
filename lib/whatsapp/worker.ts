@@ -20,6 +20,7 @@ import {
 import {
   WHATSAPP_INTERNAL_SECRET_HEADER,
   WHATSAPP_MEDIA_BUCKET,
+  type WhatsAppSessionStatus,
   type WhatsAppWebhookEvent,
 } from "@/lib/whatsapp/types";
 
@@ -42,14 +43,19 @@ type CommandRecord = {
   status: string;
 };
 
+type SessionCloseIntent = "NONE" | "LOGOUT" | "REFRESH_QR" | "STOP";
+
 type ManagedSession = {
   agencyId: string;
   authState: AuthenticationState;
+  closeIntent: SessionCloseIntent;
   pendingPersistence: Promise<void>;
   sessionId: string;
   socket: WASocket;
   store: WhatsAppSessionStore;
 };
+
+const STATUS_BROADCAST_JID = "status@broadcast";
 
 function toPhoneJid(phone: string) {
   const digits = phone.replaceAll(/[^\d]/g, "");
@@ -57,8 +63,12 @@ function toPhoneJid(phone: string) {
   return `${digits}@s.whatsapp.net`;
 }
 
+function isStatusBroadcastJid(jid: string | null | undefined) {
+  return jid === STATUS_BROADCAST_JID;
+}
+
 function isStatusBroadcastMessage(message: WAMessage) {
-  return message.key?.remoteJid === "status@broadcast";
+  return isStatusBroadcastJid(message.key?.remoteJid);
 }
 
 function sleep(ms: number) {
@@ -243,6 +253,14 @@ export class WhatsAppGatewayWorker {
   private async executeCommand(command: CommandRecord) {
     switch (command.command_type) {
       case "START_SESSION":
+        await this.postSessionUpdate({
+          agencyId: command.agency_id,
+          metadata: {
+            trigger: command.command_type,
+          },
+          sessionId: command.session_id,
+          status: "CONNECTING",
+        });
         await this.ensureSessionSocket({
           agency_id: command.agency_id,
           id: command.session_id,
@@ -254,6 +272,16 @@ export class WhatsAppGatewayWorker {
 
         return;
       case "REFRESH_QR":
+        await this.postSessionUpdate({
+          agencyId: command.agency_id,
+          metadata: {
+            trigger: command.command_type,
+          },
+          qrCode: null,
+          qrExpiresAt: null,
+          sessionId: command.session_id,
+          status: "CONNECTING",
+        });
         await this.restartSession(command.session_id, true);
         await this.completeCommand(command.id, {
           sessionId: command.session_id,
@@ -261,6 +289,16 @@ export class WhatsAppGatewayWorker {
 
         return;
       case "LOGOUT_SESSION":
+        await this.postSessionUpdate({
+          agencyId: command.agency_id,
+          metadata: {
+            trigger: command.command_type,
+          },
+          qrCode: null,
+          qrExpiresAt: null,
+          sessionId: command.session_id,
+          status: "LOGGING_OUT",
+        });
         await this.logoutSession(command.session_id, command.agency_id);
         await this.completeCommand(command.id, {
           sessionId: command.session_id,
@@ -287,12 +325,17 @@ export class WhatsAppGatewayWorker {
     }
 
     if (existing && resetAuth) {
-      this.closeManagedSession(existing);
+      this.deleteManagedSession(existing);
+      this.closeManagedSession(existing, "REFRESH_QR");
+      await existing.pendingPersistence.catch(() => undefined);
+      await existing.store.clearAllKeys();
+      resetAuth = false;
     }
 
     const managed = {
       agencyId: session.agency_id,
       authState: null as unknown as AuthenticationState,
+      closeIntent: "NONE" as SessionCloseIntent,
       pendingPersistence: Promise.resolve(),
       sessionId: session.id,
       socket: null as unknown as WASocket,
@@ -388,60 +431,125 @@ export class WhatsAppGatewayWorker {
     );
   }
 
+  private isCurrentManagedSession(managed: ManagedSession) {
+    return this.sessions.get(managed.sessionId) === managed;
+  }
+
+  private deleteManagedSession(managed: ManagedSession) {
+    if (this.isCurrentManagedSession(managed)) {
+      this.sessions.delete(managed.sessionId);
+    }
+  }
+
+  private async postSessionUpdate(input: {
+    agencyId: string;
+    deviceJid?: string | null;
+    lastConnectedAt?: string | null;
+    lastDisconnectedAt?: string | null;
+    lastError?: string | null;
+    metadata?: Record<string, unknown>;
+    phoneNumber?: string | null;
+    pushName?: string | null;
+    qrCode?: string | null;
+    qrExpiresAt?: string | null;
+    sessionId: string;
+    status: WhatsAppSessionStatus;
+  }) {
+    const now = new Date().toISOString();
+    const deviceJid = input.deviceJid ?? null;
+
+    await this.postWebhook({
+      agencyId: input.agencyId,
+      payload: {
+        createdAt: now,
+        deviceJid,
+        lastConnectedAt: input.lastConnectedAt ?? null,
+        lastDisconnectedAt: input.lastDisconnectedAt ?? null,
+        lastError: input.lastError ?? null,
+        lastEventAt: now,
+        metadata: input.metadata,
+        phoneNumber: input.phoneNumber ?? deviceJid?.split(":")[0] ?? null,
+        pushName: input.pushName ?? null,
+        qrCode: input.qrCode ?? null,
+        qrExpiresAt: input.qrExpiresAt ?? null,
+        sessionId: input.sessionId,
+        status: input.status,
+        updatedAt: now,
+      },
+      type: "session.updated",
+    });
+  }
+
   private registerSocketEvents(managed: ManagedSession) {
     managed.socket.ev.on("creds.update", async () => {
+      if (
+        !this.isCurrentManagedSession(managed) ||
+        managed.closeIntent !== "NONE"
+      ) {
+        return;
+      }
+
       await managed.store.saveCreds(managed.authState.creds);
     });
 
     managed.socket.ev.on("connection.update", async (update) => {
       try {
         if (update.qr) {
+          if (!this.isCurrentManagedSession(managed)) {
+            return;
+          }
+
           const qrCode = await QRCode.toDataURL(update.qr);
 
-          await this.postWebhook({
+          await this.postSessionUpdate({
             agencyId: managed.agencyId,
-            payload: {
-              createdAt: new Date().toISOString(),
-              deviceJid: null,
-              lastConnectedAt: null,
-              lastDisconnectedAt: null,
-              lastError: null,
-              lastEventAt: new Date().toISOString(),
-              phoneNumber: null,
-              pushName: null,
-              qrCode,
-              qrExpiresAt: new Date(Date.now() + 60_000).toISOString(),
-              sessionId: managed.sessionId,
-              status: "QR_READY",
-              updatedAt: new Date().toISOString(),
+            metadata: {
+              trigger: "QR_EMITTED",
             },
-            type: "session.updated",
+            qrCode,
+            qrExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+            sessionId: managed.sessionId,
+            status: "QR_READY",
           });
         }
 
         if (update.connection === "open") {
-          await this.postWebhook({
+          if (!this.isCurrentManagedSession(managed)) {
+            return;
+          }
+
+          managed.closeIntent = "NONE";
+
+          await this.postSessionUpdate({
             agencyId: managed.agencyId,
-            payload: {
-              createdAt: new Date().toISOString(),
-              deviceJid: managed.socket.user?.id ?? null,
-              lastConnectedAt: new Date().toISOString(),
-              lastDisconnectedAt: null,
-              lastError: null,
-              lastEventAt: new Date().toISOString(),
-              phoneNumber: managed.socket.user?.id?.split(":")[0] ?? null,
-              pushName: managed.socket.user?.name ?? null,
-              qrCode: null,
-              qrExpiresAt: null,
-              sessionId: managed.sessionId,
-              status: "CONNECTED",
-              updatedAt: new Date().toISOString(),
-            },
-            type: "session.updated",
+            deviceJid: managed.socket.user?.id ?? null,
+            lastConnectedAt: new Date().toISOString(),
+            pushName: managed.socket.user?.name ?? null,
+            qrCode: null,
+            qrExpiresAt: null,
+            sessionId: managed.sessionId,
+            status: "CONNECTED",
           });
         }
 
         if (update.connection === "close") {
+          if (managed.closeIntent !== "NONE") {
+            this.logger.info(
+              {
+                closeIntent: managed.closeIntent,
+                sessionId: managed.sessionId,
+              },
+              "ignoring intentional socket close",
+            );
+            this.deleteManagedSession(managed);
+
+            return;
+          }
+
+          if (!this.isCurrentManagedSession(managed)) {
+            return;
+          }
+
           const status = deriveDisconnectStatus(update.lastDisconnect?.error);
 
           await managed.pendingPersistence.catch(() => undefined);
@@ -451,31 +559,23 @@ export class WhatsAppGatewayWorker {
             await managed.store.clearAllKeys();
           }
 
-          await this.postWebhook({
+          await this.postSessionUpdate({
             agencyId: managed.agencyId,
-            payload: {
-              createdAt: new Date().toISOString(),
-              deviceJid: managed.socket.user?.id ?? null,
-              lastConnectedAt: null,
-              lastDisconnectedAt: new Date().toISOString(),
-              lastError:
-                update.lastDisconnect?.error instanceof Error
-                  ? update.lastDisconnect.error.message
-                  : null,
-              lastEventAt: new Date().toISOString(),
-              phoneNumber: managed.socket.user?.id?.split(":")[0] ?? null,
-              pushName: managed.socket.user?.name ?? null,
-              qrCode: null,
-              qrExpiresAt: null,
-              sessionId: managed.sessionId,
-              status,
-              updatedAt: new Date().toISOString(),
-            },
-            type: "session.updated",
+            deviceJid: managed.socket.user?.id ?? null,
+            lastDisconnectedAt: new Date().toISOString(),
+            lastError:
+              update.lastDisconnect?.error instanceof Error
+                ? update.lastDisconnect.error.message
+                : null,
+            pushName: managed.socket.user?.name ?? null,
+            qrCode: null,
+            qrExpiresAt: null,
+            sessionId: managed.sessionId,
+            status,
           });
 
           if (status === "RECONNECTING" && this.running) {
-            this.sessions.delete(managed.sessionId);
+            this.deleteManagedSession(managed);
             await sleep(4_000);
             await this.ensureSessionSocket({
               agency_id: managed.agencyId,
@@ -483,7 +583,7 @@ export class WhatsAppGatewayWorker {
               status: "RECONNECTING",
             });
           } else {
-            this.sessions.delete(managed.sessionId);
+            this.deleteManagedSession(managed);
           }
         }
       } catch (error) {
@@ -494,6 +594,13 @@ export class WhatsAppGatewayWorker {
     managed.socket.ev.on("messages.upsert", async ({ messages }) => {
       for (const message of messages as WAMessage[]) {
         try {
+          if (
+            !this.isCurrentManagedSession(managed) ||
+            managed.closeIntent !== "NONE"
+          ) {
+            continue;
+          }
+
           if (isStatusBroadcastMessage(message)) {
             continue;
           }
@@ -508,13 +615,24 @@ export class WhatsAppGatewayWorker {
     managed.socket.ev.on("messages.update", async (updates) => {
       for (const update of updates as Array<Record<string, unknown>>) {
         try {
+          if (
+            !this.isCurrentManagedSession(managed) ||
+            managed.closeIntent !== "NONE"
+          ) {
+            continue;
+          }
+
           const key = update.key as
             | { id?: unknown; remoteJid?: unknown }
             | undefined;
           const status = (update.update as { status?: unknown } | undefined)
             ?.status;
 
-          if (key?.remoteJid === "status@broadcast") {
+          if (
+            isStatusBroadcastJid(
+              typeof key?.remoteJid === "string" ? key.remoteJid : null,
+            )
+          ) {
             continue;
           }
 
@@ -545,6 +663,10 @@ export class WhatsAppGatewayWorker {
       communicationId?: string | null;
     },
   ) {
+    if (isStatusBroadcastMessage(message)) {
+      return;
+    }
+
     const storedMedia = await this.persistMessageMedia(managed, message);
     const normalized = normalizeIncomingMessage({
       rawMessage: message,
@@ -709,12 +831,13 @@ export class WhatsAppGatewayWorker {
     const existing = this.sessions.get(sessionId);
 
     if (existing) {
+      this.deleteManagedSession(existing);
+      this.closeManagedSession(existing, resetAuth ? "REFRESH_QR" : "STOP");
+      await existing.pendingPersistence.catch(() => undefined);
+
       if (resetAuth) {
         await existing.store.clearAllKeys();
       }
-
-      this.closeManagedSession(existing);
-      this.sessions.delete(sessionId);
     }
 
     const { data, error } = await this.supabase
@@ -727,50 +850,50 @@ export class WhatsAppGatewayWorker {
       throw error ?? new Error("WhatsApp session not found");
     }
 
-    await this.ensureSessionSocket(data as SessionRecord, resetAuth);
+    await this.ensureSessionSocket(data as SessionRecord, resetAuth && !existing);
   }
 
   private async logoutSession(sessionId: string, agencyId: string) {
     const existing = this.sessions.get(sessionId);
 
     if (existing) {
+      this.deleteManagedSession(existing);
+      existing.closeIntent = "LOGOUT";
+
       try {
         await existing.socket.logout();
       } catch (error) {
         this.logger.warn({ err: error }, "socket logout raised");
       }
 
+      await existing.pendingPersistence.catch(() => undefined);
       await existing.store.clearAllKeys();
-      this.closeManagedSession(existing);
-      this.sessions.delete(sessionId);
+      this.closeManagedSession(existing, "LOGOUT");
     } else {
       const store = new WhatsAppSessionStore(this.supabase, sessionId);
 
       await store.clearAllKeys();
     }
 
-    await this.postWebhook({
+    await this.postSessionUpdate({
       agencyId,
-      payload: {
-        createdAt: new Date().toISOString(),
-        deviceJid: null,
-        lastConnectedAt: null,
-        lastDisconnectedAt: new Date().toISOString(),
-        lastError: null,
-        lastEventAt: new Date().toISOString(),
-        phoneNumber: null,
-        pushName: null,
-        qrCode: null,
-        qrExpiresAt: null,
-        sessionId,
-        status: "LOGGED_OUT",
-        updatedAt: new Date().toISOString(),
+      lastDisconnectedAt: new Date().toISOString(),
+      metadata: {
+        trigger: "LOGOUT_SESSION",
       },
-      type: "session.updated",
+      qrCode: null,
+      qrExpiresAt: null,
+      sessionId,
+      status: "LOGGED_OUT",
     });
   }
 
-  private closeManagedSession(managed: ManagedSession) {
+  private closeManagedSession(
+    managed: ManagedSession,
+    closeIntent: SessionCloseIntent = "STOP",
+  ) {
+    managed.closeIntent = closeIntent;
+
     const candidate = managed.socket as WASocket & {
       end?: (error?: Error) => void;
       ws?: { close?: () => void };

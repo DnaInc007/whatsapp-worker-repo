@@ -6,6 +6,8 @@ import type {
 
 import { BufferJSON, type WAMessage } from "@whiskeysockets/baileys";
 
+const STATUS_BROADCAST_JID = "status@broadcast";
+
 function toPlainJson<T>(value: T) {
   return JSON.parse(JSON.stringify(value, BufferJSON.replacer)) as T;
 }
@@ -212,7 +214,7 @@ export function normalizeIncomingMessage(input: {
     return null;
   }
 
-  if (remoteJid === "status@broadcast") {
+  if (remoteJid === STATUS_BROADCAST_JID) {
     return null;
   }
 
